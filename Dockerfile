@@ -15,10 +15,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ソースコードのコピー
-COPY app.py .
+COPY hems.py .
 
 # Flaskのポート番号
 EXPOSE 8000
 
 # 起動コマンド
-CMD ["python", "app.py"]
+CMD ["python", "hems.py"]
