@@ -1,24 +1,15 @@
-# 軽量なPythonイメージを使用
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# 作業ディレクトリの設定
 WORKDIR /app
 
-# 必要なパッケージをインストール
-# sqlite3の動作に必要なライブラリ等を含める
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-# 依存関係ファイルのコピーとインストール
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ソースコードのコピー
+# コピー元と起動対象を hems.py に変更
 COPY hems.py .
 
-# Flaskのポート番号
-EXPOSE 8000
+RUN mkdir -p /app/data
 
-# 起動コマンド
+ENV HEMS_IP=192.168.0.146
+
 CMD ["python", "hems.py"]
