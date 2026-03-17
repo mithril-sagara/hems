@@ -1,40 +1,27 @@
-import socket
-import time
-import threading
-import sqlite3
-import requests
-import os
-from flask import Flask, jsonify, render_template_string
+import socket, time, threading, sqlite3, requests, os, calendar
+from flask import Flask, jsonify, render_template_string, request
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import calendar
 
-# .envファイルから環境変数を読み込む
 load_dotenv()
-
-# --- 設定 ---
 IP = os.environ.get("HEMS_IP", "192.168.0.146")
 PORT = 3610
-SOLAR_EOJ = [0x02, 0x79, 0x01]
-METER_EOJ = [0x02, 0xA5, 0x01]
-MAX_W = 5900  
-LAT = float(os.environ.get("HEMS_LAT", "33.46"))
-LON = float(os.environ.get("HEMS_LON", "130.54"))
+SOLAR_EOJ, METER_EOJ = [0x02, 0x79, 0x01], [0x02, 0xA5, 0x01]
+MAX_W, LAT, LON = 5900, 33.46, 130.54
 
 app = Flask(__name__)
-latest = {"solar": 0, "buy": 0, "sell": 0, "home": 0, "self_cons": 0, "cloud": 0, "forecast": 0, "cost": 0, "irradiance": 0}
+latest = {"solar": 0, "buy": 0, "sell": 0, "home": 0, "cloud": 0, "forecast": 0, "irradiance": 0, "cost_min": 0, "weather_code": 0}
 
-def get_advanced_forecast():
+def get_forecast():
     try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}&hourly=direct_radiation,diffuse_radiation,cloud_cover&timezone=Asia%2FTokyo&forecast_days=2"
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}&hourly=direct_radiation,diffuse_radiation,cloud_cover,weathercode&timezone=Asia%2FTokyo&forecast_days=3"
         res = requests.get(url, timeout=5).json()
-        f_map = {}
-        for i in range(len(res['hourly']['time'])):
-            t_str = res['hourly']['time'][i].replace("T", " ") + ":00"
-            irradiance = res['hourly']['direct_radiation'][i] + res['hourly']['diffuse_radiation'][i]
-            est_w = int(MAX_W * (irradiance / 1000) * 0.85)
-            f_map[t_str] = {"w": max(0, est_w), "cloud": res['hourly']['cloud_cover'][i], "irr": irradiance}
-        return f_map
+        return {res['hourly']['time'][i].replace("T", " ") + ":00": {
+            "w": int(MAX_W * ((res['hourly']['direct_radiation'][i] + res['hourly']['diffuse_radiation'][i]) / 1000) * 0.85),
+            "cloud": res['hourly']['cloud_cover'][i],
+            "irr": res['hourly']['direct_radiation'][i] + res['hourly']['diffuse_radiation'][i],
+            "code": res['hourly']['weathercode'][i]
+        } for i in range(len(res['hourly']['time']))}
     except: return {}
 
 def fetch_echonet(eoj, epc):
@@ -46,238 +33,188 @@ def fetch_echonet(eoj, epc):
             return data[idx+2 : idx+2+data[idx+1]]
     except: return None
 
+def get_unit_price(dt):
+    if dt.hour >= 21 or dt.hour < 7: return 16.6
+    return 33.8 if dt.month in [7, 8, 9] else 28.6
+
 def collector():
-    db_path = "data/energy.db" if os.path.exists("data") else "energy.db"
-    if not os.path.exists("data") and "data/" in db_path: os.makedirs("data")
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.execute("CREATE TABLE IF NOT EXISTS energy(time TEXT, solar REAL, buy REAL, sell REAL, home REAL, self_cons REAL, cloud REAL, forecast REAL, irradiance REAL)")
-    conn.commit(); conn.close()
+    conn = sqlite3.connect("energy.db", check_same_thread=False)
+    conn.execute("CREATE TABLE IF NOT EXISTS energy(time TEXT PRIMARY KEY, solar REAL, buy REAL, sell REAL, home REAL, cloud REAL, forecast REAL, irradiance REAL, weather_code INTEGER)")
     while True:
-        f_map = get_advanced_forecast()
-        now_h = datetime.now().strftime("%Y-%m-%d %H:00:00")
-        f_info = f_map.get(now_h, {"w": 0, "cloud": 0, "irr": 0})
-        latest["forecast"], latest["cloud"], latest["irradiance"] = f_info["w"], f_info["cloud"], f_info["irr"]
+        f_map = get_forecast()
+        now = datetime.now()
         
-        res_s = fetch_echonet(SOLAR_EOJ, 0xE0)
-        if res_s: latest["solar"] = int.from_bytes(res_s, "big", signed=True)
-        res_m = fetch_echonet(METER_EOJ, 0xF5)
+        # 1. 実績取得
+        res_s, res_m = fetch_echonet(SOLAR_EOJ, 0xE0), fetch_echonet(METER_EOJ, 0xF5)
+        solar = int.from_bytes(res_s, "big", signed=True) if res_s else 0
+        buy, sell = 0, 0
         if res_m and len(res_m) >= 8:
-            v1 = int.from_bytes(res_m[0:4], "big", signed=True)
-            v2 = int.from_bytes(res_m[4:8], "big", signed=True)
-            latest["sell"], latest["buy"] = (v1, 0) if v1 >= 0 else (0, abs(v1))
-            latest["home"] = v2
-            latest["self_cons"] = max(0, latest["solar"] - latest["sell"])
-            
-        conn = sqlite3.connect(db_path)
-        conn.execute("INSERT INTO energy VALUES (?,?,?,?,?,?,?,?,?)",
-                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                     latest["solar"], latest["buy"], latest["sell"], latest["home"], latest["self_cons"], latest["cloud"], latest["forecast"], latest["irradiance"]))
+            val = int.from_bytes(res_m[0:4], "big", signed=True)
+            sell, buy = (val, 0) if val >= 0 else (0, abs(val))
         
-        today = datetime.now().strftime("%Y-%m-%d")
-        buy_rows = conn.execute("SELECT time, buy FROM energy WHERE date(time) = ?", (today,)).fetchall()
-        total_cost = 0.0
-        for r_t, r_b in buy_rows:
-            dt = datetime.strptime(r_t, "%Y-%m-%d %H:%M:%S")
-            rate = 16.6 if (21 <= dt.hour or dt.hour < 7) else (33.8 if dt.month in [7,8,9] else 28.6)
-            total_cost += (r_b / 1000 / 60) * rate
-        latest["cost"] = int(total_cost)
-        conn.commit(); conn.close(); time.sleep(60)
+        home = max(0, solar + buy - sell)
+        cost_min = (buy / 1000.0) * (get_unit_price(now) / 60.0)
+        
+        # 2. 現在時刻の「時」に対応する予報を取得
+        cur_hour = now.strftime("%Y-%m-%d %H:00:00")
+        f_info = f_map.get(cur_hour, {"w": 0, "cloud": 0, "irr": 0, "code": 0})
+        
+        # 3. 実績保存（今の予測値も混ぜる）
+        conn.execute("INSERT OR REPLACE INTO energy VALUES (?,?,?,?,?,?,?,?,?)", 
+                     (now.strftime("%Y-%m-%d %H:%M:00"), solar, buy, sell, home, f_info["cloud"], f_info["w"], f_info["irr"], f_info["code"]))
+        
+        # 4. 未来の予測枠も作成（実績がない時間の点線用）
+        for ft, fi in f_map.items():
+            conn.execute("""
+                INSERT INTO energy(time, forecast, cloud, irradiance, weather_code) VALUES (?,?,?,?,?)
+                ON CONFLICT(time) DO UPDATE SET forecast=excluded.forecast, cloud=excluded.cloud, 
+                irradiance=excluded.irradiance, weather_code=excluded.weather_code
+            """, (ft, fi["w"], fi["cloud"], fi["irr"], fi["code"]))
+        
+        latest.update({"solar": solar, "buy": buy, "sell": sell, "home": home, "cost_min": cost_min})
+        conn.commit(); time.sleep(60)
 
 @app.route("/api/live")
 def api_live():
-    total_cons = latest["self_cons"] + latest["buy"]
-    sr = int((latest["self_cons"] / total_cons * 100)) if total_cons > 50 else 0
-    return jsonify({**latest, "sr": sr})
+    solar_self = max(0, latest["solar"] - latest["sell"])
+    scr = int((solar_self / max(1, latest["solar"])) * 100) if latest["solar"] > 0 else 0
+    return jsonify({**latest, "scr": min(scr, 100), "dt": datetime.now().strftime("%Y/%m/%d %H:%M:%S")})
 
 @app.route("/api/stats/<mode>")
 def api_stats(mode):
-    db_path = "data/energy.db" if os.path.exists("data") else "energy.db"
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    now = datetime.now()
-    res = []
-
+    target = request.args.get('date', datetime.now().strftime("%Y-%m-%d"))
+    conn = sqlite3.connect("energy.db"); conn.row_factory = sqlite3.Row
+    
     if mode == "hour":
-        f_map = get_advanced_forecast()
-        start_t = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-        rows = conn.execute("SELECT * FROM energy WHERE time >= ? ORDER BY time ASC", (start_t,)).fetchall()
-        for r in rows:
-            dt = datetime.strptime(r['time'], "%Y-%m-%d %H:%M:%S")
-            b_kwh, s_kwh = r['buy'] / 1000 / 60, r['sell'] / 1000 / 60
-            res.append({
-                "label": dt.strftime("%H:%M"), "solar": r['solar'], "buy": r['buy'], "sell": r['sell'], "self_cons": r['self_cons'],
-                "cloud": r['cloud'], "irr": r['irradiance'], "forecast": f_map.get(dt.strftime("%Y-%m-%d %H:00:00"), {"w":0})["w"],
-                "nb": round(b_kwh, 3), "ds": round(s_kwh, 3), "bat": round(min(b_kwh, s_kwh), 2)
-            })
-        for i in range(1, 13):
-            fut = now + timedelta(minutes=i*5)
-            f_val = f_map.get(fut.strftime("%Y-%m-%d %H:00:00"), {"w":0, "cloud":0, "irr":0})
-            res.append({"label": fut.strftime("%H:%M"), "solar": None, "buy": None, "sell": None, "self_cons": None, "cloud": f_val["cloud"], "irr": f_val["irr"], "forecast": f_val["w"], "nb": 0, "ds": 0, "bat": 0})
-
+        labels = [(datetime.now() - timedelta(minutes=i)).strftime("%H:%M") for i in range(59, -1, -1)]
+        fmt, where = "strftime('%H:%M', time)", "time >= datetime('now','-60 minutes','localtime')"
     elif mode == "day":
-        today_str = now.strftime("%Y-%m-%d")
-        f_map = get_advanced_forecast()
-        for h in range(24):
-            for m in [0, 30]:
-                lbl = f"{h:02}:{m:02}"
-                start_win = f"{today_str} {h:02}:{m:02}:00"
-                end_win = f"{today_str} {h:02}:{m+29:02}:59"
-                row = conn.execute("SELECT AVG(solar), AVG(sell), AVG(self_cons), AVG(cloud), AVG(irradiance), AVG(buy), SUM(buy)/60/1000, SUM(sell)/60/1000 FROM energy WHERE time BETWEEN ? AND ?", (start_win, end_win)).fetchone()
-                nb, ds = row[6] or 0, row[7] or 0
-                f_val = f_map.get(f"{today_str} {h:02}:00:00", {"w":0})["w"]
-                res.append({
-                    "label": lbl, "solar": int(row[0]) if row[0] else 0, "buy": int(row[5]) if row[5] else 0, "sell": int(row[1]) if row[1] else 0,
-                    "self_cons": int(row[2]) if row[2] else 0, "cloud": int(row[3]) if row[3] else 0,
-                    "irr": int(row[4]) if row[4] else 0, "forecast": f_val,
-                    "nb": round(nb, 2), "ds": round(ds, 2), "bat": round(min(nb, ds), 2)
-                })
-
+        labels = [f"{h:02}:{m:02}" for h in range(24) for m in [0, 30]]
+        fmt, where = "printf('%02d:%02d', CAST(strftime('%H', time) AS INT), (CAST(strftime('%M', time) AS INT)/30*30))", f"date(time) = '{target}'"
     elif mode == "month":
-        year_month = now.strftime("%Y-%m-")
-        days = calendar.monthrange(now.year, now.month)[1]
-        for d in range(1, days + 1):
-            t_s = f"{year_month}{d:02}%"
-            row = conn.execute("SELECT SUM(solar)/60/1000, SUM(sell)/60/1000, SUM(self_cons)/60/1000, AVG(cloud), AVG(irradiance), SUM(forecast)/60/1000, SUM(buy)/60/1000 FROM energy WHERE time LIKE ?", (t_s,)).fetchone()
-            row_n = conn.execute("SELECT SUM(buy)/60/1000 FROM energy WHERE time LIKE ? AND (strftime('%H', time) >= '18' OR strftime('%H', time) < '07')", (t_s,)).fetchone()
-            row_e = conn.execute("SELECT SUM(sell)/60/1000 FROM energy WHERE time LIKE ? AND (strftime('%H', time) >= '07' AND strftime('%H', time) < '18')", (t_s,)).fetchone()
-            nb, ds = row_n[0] or 0, row_e[0] or 0
-            res.append({
-                "label": f"{d}日", "solar": round(row[0],1) if row[0] else 0, "buy": round(row[6],1) if row[6] else 0, "sell": round(row[1],1) if row[1] else 0,
-                "self_cons": round(row[2],1) if row[2] else 0, "cloud": int(row[3]) if row[3] else 0,
-                "irr": int(row[4]) if row[4] else 0, "forecast": round(row[5],1) if row[5] else 0,
-                "nb": round(nb, 2), "ds": round(ds, 2), "bat": round(min(nb, ds), 1)
-            })
+        y, m = map(int, target.split('-'))
+        labels = [f"{m:02}/{d:02}" for d in range(1, calendar.monthrange(y, m)[1] + 1)]
+        fmt, where = "strftime('%m/%d', time)", f"strftime('%Y-%m', time) = '{target}'"
+    else:
+        labels = [f"{m:02}月" for m in range(1, 13)]
+        fmt, where = "strftime('%m月', time)", f"strftime('%Y', time) = '{target}'"
 
-    elif mode == "year":
-        for m in range(1, 13):
-            t_s = now.strftime("%Y-") + f"{m:02}-%"
-            row = conn.execute("SELECT SUM(solar)/60/1000, SUM(sell)/60/1000, SUM(self_cons)/60/1000, AVG(cloud), AVG(irradiance), SUM(forecast)/60/1000, SUM(buy)/60/1000 FROM energy WHERE time LIKE ?", (t_s,)).fetchone()
-            row_n = conn.execute("SELECT AVG(buy) FROM energy WHERE time LIKE ? AND (strftime('%H', time) >= '18' OR strftime('%H', time) < '07')", (t_s,)).fetchone()
-            row_e = conn.execute("SELECT AVG(sell) FROM energy WHERE time LIKE ? AND (strftime('%H', time) >= '07' AND strftime('%H', time) < '18')", (t_s,)).fetchone()
-            nb_avg = (row_n[0] or 0) * 13 / 1000
-            ds_avg = (row_e[0] or 0) * 11 / 1000
-            res.append({
-                "label": f"{m}月", "solar": int(row[0]) if row[0] else 0, "buy": int(row[6]) if row[6] else 0, "sell": int(row[1]) if row[1] else 0,
-                "self_cons": int(row[2]) if row[2] else 0, "cloud": int(row[3]) if row[3] else 0,
-                "irr": int(row[4]) if row[4] else 0, "forecast": int(row[5]) if row[5] else 0,
-                "nb": round(nb_avg, 1), "ds": round(ds_avg, 1), "bat": round(min(nb_avg, ds_avg), 1)
-            })
-    conn.close()
-    return jsonify(res)
+    # 発電予測は日モードのみ
+    sql = f"""SELECT {fmt} as lbl, AVG(solar) as s, {'AVG(forecast)' if mode=='day' else 'NULL'} as f, 
+              AVG(sell) as sl, AVG(buy) as b, AVG(home) as h, AVG(cloud) as c, AVG(irradiance) as i, 
+              MAX(weather_code) as wc FROM energy WHERE {where} GROUP BY lbl ORDER BY lbl ASC"""
+    db_data = {r['lbl']: r for r in conn.execute(sql).fetchall()}
+    
+    stat_sql = f"SELECT SUM(CASE WHEN (strftime('%H',time)*1 >= 21 OR strftime('%H',time)*1 < 7) THEN buy ELSE 0 END)/60.0, SUM(CASE WHEN (strftime('%H',time)*1 >= 7 AND strftime('%H',time)*1 < 21) THEN sell ELSE 0 END)/60.0 FROM energy WHERE {where}"
+    stats = conn.execute(stat_sql).fetchone()
+
+    chart_res = []
+    for lbl in labels:
+        r = db_data.get(lbl)
+        s_val = r['s'] if r and r['s'] is not None else None
+        f_val = r['f'] if r and r['f'] is not None else None
+        chart_res.append({"label": lbl, "solar": s_val, "forecast": f_val, "sell": r['sl'] if r else None, "buy": r['b'] if r else None, "home": r['h'] if r else None})
+
+    list_res = []
+    if mode == "day":
+        l_sql = f"""SELECT strftime('%H:00', time) as lbl, SUM(solar)/60.0 as s, AVG(forecast) as f, SUM(sell)/60.0 as sl, 
+                    SUM(buy)/60.0 as b, SUM(home)/60.0 as h, AVG(cloud) as c, AVG(irradiance) as i, MAX(weather_code) as wc
+                    FROM energy WHERE date(time) = '{target}' GROUP BY lbl ORDER BY lbl ASC"""
+        list_res = [dict(r) for r in conn.execute(l_sql).fetchall()]
+
+    return jsonify({"chart": chart_res, "list": list_res if mode=="day" else chart_res, "total": {"nb": round(stats[0] or 0, 2), "ds": round(stats[1] or 0, 2), "bat": round(min(stats[0] or 0, stats[1] or 0)/0.9, 2)}})
 
 @app.route("/")
 def index():
     return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8"><title>筑紫野 HEMS PRO</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <style>
-            body { font-family: -apple-system, sans-serif; background: #f4f7f9; padding: 20px; color: #333; }
-            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; max-width: 1200px; margin: auto; }
-            .card { background: white; padding: 20px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); text-align: center; }
-            .val { font-size: 28px; font-weight: 800; display: block; margin-top: 8px; }
-            .controls { max-width: 1200px; margin: 30px auto; display: flex; gap: 12px; justify-content: center; }
-            button { padding: 10px 20px; border-radius: 8px; border: 1px solid #ddd; cursor: pointer; background: white; font-weight: bold; }
-            button.active { background: #3498db; color: white; border-color: #3498db; }
-            .view-box { background: white; padding: 20px; border-radius: 20px; max-width: 1200px; margin: auto; box-shadow: 0 10px 30px rgba(0,0,0,0.05); overflow-x: auto; }
-            #chart-area { height: 60vh; min-height: 400px; }
-            table { width: 100%; border-collapse: collapse; font-size: 11px; min-width: 900px; }
-            th { background: #f8f9fa; position: sticky; top: 0; }
-            th, td { border-bottom: 1px solid #eee; padding: 10px 4px; text-align: center; }
-            .bat-val { font-weight: bold; color: #d35400; background: #fff3e0; border-radius: 4px; padding: 2px 4px; }
-            .hidden { display: none; }
-        </style>
-    </head>
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: sans-serif; background: #f8fafc; margin: 0; padding: 20px; }
+        .clock { position: absolute; top: 15px; right: 20px; font-weight: bold; color: #475569; }
+        .live-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 30px; margin-bottom: 25px; }
+        .live-card { background: #fff; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        .live-card span { font-size: 1.1rem; font-weight: 800; display: block; margin-bottom: 5px; color: #94a3b8; }
+        .live-val { font-size: 2.2rem; font-weight: 900; line-height: 1; }
+        .main-box { background: #fff; border-radius: 16px; padding: 25px; }
+        .nav { display: flex; justify-content: space-between; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
+        .btn-group { display: flex; gap: 5px; background: #f1f5f9; padding: 5px; border-radius: 10px; }
+        button { border: none; padding: 8px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        button.active { background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); color: #2563eb; }
+        .hidden { display: none; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        th { position: sticky; top: 0; background: #f8fafc; padding: 12px; border-bottom: 2px solid #e2e8f0; }
+        td { padding: 12px; border-bottom: 1px solid #f1f5f9; text-align: center; }
+        .weather-ico { font-size: 2rem; }
+        .stat-bar { margin-top: 15px; font-weight: bold; color: #1e40af; background: #eff6ff; padding: 12px; border-radius: 8px; }
+    </style></head>
     <body>
-        <div class="grid">
-            <div class="card">☀️ 発電<br><span class="val" id="s">-</span></div>
-            <div class="card">🏠 自家消費<br><span class="val" style="color:#9b59b6;" id="sc">-</span></div>
-            <div class="card">📤 売電中<br><span class="val" style="color:#2ecc71;" id="sl">-</span></div>
-            <div class="card">🔌 買電中<br><span class="val" style="color:#e74c3c;" id="b">-</span></div>
-            <div class="card">💰 今日料金<br><span class="val" id="c">-</span></div>
-            <div class="card">♻️ 自給率<br><span class="val" id="sr">-</span></div>
+        <div class="clock" id="clock">0000/00/00 00:00:00</div>
+        <div class="live-grid">
+            <div class="live-card"><span>☀️ 発電</span><div class="live-val" id="ls" style="color:#f59e0b">0W</div></div>
+            <div class="live-card"><span>📤 売電</span><div class="live-val" id="lsl" style="color:#10b981">0W</div></div>
+            <div class="live-card"><span>🔌 買電</span><div class="live-val" id="lb" style="color:#ef4444">0W</div></div>
+            <div class="live-card"><span>🏠 自己消費</span><div class="live-val" id="lh" style="color:#8b5cf6">0W</div></div>
+            <div class="live-card"><span>💴 電気代(分)</span><div class="live-val" id="lc" style="color:#475569">0.0円</div></div>
+            <div class="live-card"><span>📈 自己消費率</span><div class="live-val" id="lscr" style="color:#06b6d4">0%</div></div>
         </div>
-        <div class="controls">
-            <button class="m-btn active" onclick="setMode('hour', this)">前後1時間</button>
-            <button class="m-btn" onclick="setMode('day', this)">今日</button>
-            <button class="m-btn" onclick="setMode('month', this)">月</button>
-            <button class="m-btn" onclick="setMode('year', this)">年</button>
-            <span style="width:20px"></span>
-            <button class="v-btn active" onclick="setView('chart', this)">グラフ</button>
-            <button class="v-btn" onclick="setView('table', this)">リスト</button>
-        </div>
-        <div class="view-box">
-            <div id="chart-area"><canvas id="mainChart"></canvas></div>
-            <div id="table-area" class="hidden">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>時間軸</th><th>発電実績</th><th>自家消費</th><th>売電量</th>
-                            <th>買電量</th><th>発電(予測)</th><th>日照量</th><th>雲量</th>
-                            <th>昼間余剰</th><th>夜間買電</th><th>蓄電池必要量</th>
-                        </tr>
-                    </thead>
-                    <tbody id="table-body"></tbody>
-                </table>
+        <div class="main-box">
+            <div class="nav">
+                <div class="btn-group"><button onclick="setM('hour',this)" class="m-btn active">1時間</button><button onclick="setM('day',this)" class="m-btn">日</button><button onclick="setM('month',this)" class="m-btn">月</button><button onclick="setM('year',this)" class="m-btn">年</button></div>
+                <div><input type="date" id="dp" onchange="update()"><input type="month" id="mp" onchange="update()" class="hidden"><select id="yp" onchange="update()" class="hidden"></select></div>
+                <div class="btn-group"><button onclick="setV('chart',this)" class="v-btn active">グラフ</button><button onclick="setV('list',this)" class="v-btn">リスト</button></div>
+            </div>
+            <div id="cp" style="height:50vh;"><canvas id="mainChart"></canvas></div>
+            <div id="lp" class="hidden">
+                <div style="max-height:50vh; overflow-y:auto; border:1px solid #e2e8f0; border-radius:12px;">
+                    <table><thead><tr><th>時間軸</th><th>発電</th><th>予測</th><th>売電</th><th>買電</th><th>自己消費</th><th>自己消費率</th><th>天気</th><th>雲量</th><th>日射</th></tr></thead><tbody id="tb"></tbody></table>
+                </div>
+                <div id="sb" class="stat-bar"></div>
             </div>
         </div>
         <script>
-            let chart; let currentMode = 'hour'; let currentView = 'chart';
-            async function updateLive() {
-                const res = await fetch('/api/live'); const d = await res.json();
-                document.getElementById('s').innerText = d.solar + 'W';
-                document.getElementById('sc').innerText = d.self_cons + 'W';
-                document.getElementById('sl').innerText = d.sell + 'W';
-                document.getElementById('b').innerText = d.buy + 'W';
-                document.getElementById('c').innerText = d.cost + '円';
-                document.getElementById('sr').innerText = d.sr + '%';
-            }
-            async function updateStats() {
-                const res = await fetch('/api/stats/' + currentMode); const d = await res.json();
-                let h = '';
-                const unit = (currentMode === 'hour' || currentMode === 'day') ? 'W' : 'kWh';
-                d.forEach(x => {
-                    h += `<tr>
-                        <td>${x.label}</td>
-                        <td>${x.solar??'-'}${unit}</td>
-                        <td>${x.self_cons??'-'}${unit}</td>
-                        <td>${x.sell??'-'}${unit}</td>
-                        <td>${x.buy??'-'}${unit}</td>
-                        <td style="color:#7f8c8d">${x.forecast}${unit}</td>
-                        <td>${x.irr}W/m²</td>
-                        <td>${x.cloud}%</td>
-                        <td>${x.ds}kWh</td>
-                        <td>${x.nb}kWh</td>
-                        <td><span class="bat-val">${x.bat}kWh</span></td>
-                    </tr>`;
-                });
-                document.getElementById('table-body').innerHTML = h;
-                if (currentView === 'chart') {
+            let chart; let mode='hour'; let view='chart';
+            const wEmoji = {0:"☀️", 1:"☀️", 2:"⛅", 3:"☁️", 45:"🌫️", 51:"🌦️", 61:"☔", 71:"❄️", 95:"⚡"};
+            const yp = document.getElementById('yp'); const now = new Date();
+            for(let y=2024; y<=now.getFullYear()+1; y++){ let o=document.createElement('option'); o.value=y; o.text=y+'年'; yp.add(o); }
+            yp.value = now.getFullYear(); document.getElementById('dp').valueAsDate = now; document.getElementById('mp').value = now.toISOString().slice(0,7);
+
+            async function update() {
+                const live = await (await fetch('/api/live')).json();
+                document.getElementById('clock').innerText = live.dt;
+                document.getElementById('ls').innerText = live.solar + 'W'; document.getElementById('lsl').innerText = live.sell + 'W';
+                document.getElementById('lb').innerText = live.buy + 'W'; document.getElementById('lh').innerText = live.home + 'W';
+                document.getElementById('lc').innerText = live.cost_min.toFixed(1) + '円'; document.getElementById('lscr').innerText = live.scr + '%';
+                
+                let dv = (mode==='day')?document.getElementById('dp').value:(mode==='month')?document.getElementById('mp').value:yp.value;
+                const res = await (await fetch(`/api/stats/${mode}?date=${dv}`)).json();
+                
+                if(view==='chart') {
                     const ctx = document.getElementById('mainChart').getContext('2d');
                     if(chart) chart.destroy();
-                    chart = new Chart(ctx, {
-                        type: 'line',
-                        data: {
-                            labels: d.map(x => x.label),
-                            datasets: [
-                                { label:'発電実績', data:d.map(x=>x.solar), borderColor:'#f1c40f', backgroundColor:'#f1c40f15', fill:true, tension:0.2, spanGaps:true },
-                                { label:'発電予測', data:d.map(x=>x.forecast), borderColor:'#95a5a6', borderDash:[5,5], fill:false, tension:0.2, pointRadius:0 },
-                                { label:'自家消費', data:d.map(x=>x.self_cons), borderColor:'#9b59b6', tension:0.2, spanGaps:true },
-                                { label:'売電', data:d.map(x=>x.sell), borderColor:'#2ecc71', spanGaps:true },
-                                { label:'買電', data:d.map(x=>x.buy), borderColor:'#e74c3c', spanGaps:true }
-                            ]
-                        }, options: { maintainAspectRatio: false, animation: false, plugins: { legend: { position: 'bottom' } }, scales: { y: { beginAtZero: true } } }
-                    });
+                    chart = new Chart(ctx, { type: 'line', data: {
+                        labels: res.chart.map(d => d.label),
+                        datasets: [
+                            { label:'発電', data:res.chart.map(d=>d.solar), borderColor:'#f59e0b', tension:0.4, pointRadius: ctx => ctx.raw === null ? 0 : 3, fill:true, backgroundColor:'rgba(245,158,11,0.05)', spanGaps:true },
+                            { label:'自家消費', data:res.chart.map(d=>d.home), borderColor:'#8b5cf6', tension:0.4, pointRadius: ctx => ctx.raw === null ? 0 : 3, spanGaps:true },
+                            { label:'売電', data:res.chart.map(d=>d.sell), borderColor:'#10b981', tension:0.4, pointRadius: ctx => ctx.raw === null ? 0 : 3, spanGaps:true },
+                            { label:'買電', data:res.chart.map(d=>d.buy), borderColor:'#ef4444', tension:0.4, pointRadius: ctx => ctx.raw === null ? 0 : 3, spanGaps:true },
+                            { label:'予測', data:res.chart.map(d=>d.forecast), borderColor:'#94a3b8', borderDash:[5,5], pointRadius: ctx => ctx.raw === null ? 0 : 3, spanGaps:true }
+                        ]}, options: { maintainAspectRatio:false, scales:{x:{ticks:{callback:function(v,i){ const l=this.getLabelForValue(v); return (mode==='day'&&!l.endsWith(':00'))?'':(mode==='hour'&&i%5!==0)?'':l; }}}}}});
                 }
+                let h = ''; const unit = mode==='day'?'kWh':'W';
+                res.list.forEach(d => {
+                    const s = d.s || 0; const sl = d.sl || 0;
+                    const scr = s > 0 ? Math.min(100, Math.round(((s - sl)/s)*100)) : 0;
+                    h += `<tr><td>${d.lbl}</td><td>${Math.round(s)}${unit}</td><td>${d.f !== null ? Math.round(d.f) + 'W' : '-'}</td><td>${Math.round(sl)}${unit}</td><td>${Math.round(d.b || 0)}${unit}</td><td>${Math.round(d.h || 0)}${unit}</td><td>${scr}%</td><td class="weather-ico">${wEmoji[d.wc]||'-'}</td><td>${d.c!==null?d.c+'%':'-'}</td><td>${d.i!==null?Math.round(d.i):'-'}</td></tr>`;
+                });
+                document.getElementById('tb').innerHTML = h;
+                document.getElementById('sb').innerText = `夜間買電: ${res.total.nb}kWh / 昼間売電: ${res.total.ds}kWh / 推奨電池容量: ${res.total.bat}kWh`;
             }
-            function setMode(m, btn){ currentMode=m; document.querySelectorAll('.m-btn').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); updateStats(); }
-            function setView(v, btn){ currentView=v; document.querySelectorAll('.v-btn').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); document.getElementById('chart-area').classList.toggle('hidden', v!=='chart'); document.getElementById('table-area').classList.toggle('hidden', v!=='table'); updateStats(); }
-            setInterval(updateLive, 5000); updateLive(); updateStats();
+            function setM(m,b){ mode=m; document.querySelectorAll('.m-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); document.getElementById('dp').classList.toggle('hidden',m!=='day'); document.getElementById('mp').classList.toggle('hidden',m!=='month'); yp.classList.toggle('hidden',m!=='year'); update(); }
+            function setV(v,b){ view=v; document.getElementById('cp').classList.toggle('hidden',v!=='chart'); document.getElementById('lp').classList.toggle('hidden',v!=='list'); document.querySelectorAll('.v-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); update(); }
+            setInterval(update, 60000); update();
         </script>
-    </body>
-    </html>
+    </body></html>
     """)
 
 if __name__ == "__main__":
