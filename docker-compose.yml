@@ -1,15 +1,13 @@
 version: '3.8'
 
 services:
-  hems-pro:
+  hems-app:
     build: .
-    container_name: hems-pro
+    container_name: hems-container
     restart: always
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    environment:
+      - HEMS_IP=192.168.0.146
     volumes:
-      - ./data:/app/data
-    # データベースの保存先を/app/data/energy.dbに変更する場合、
-    # app.py内のsqlite3.connect("energy.db")を"data/energy.db"に書き換えてください。
+      - ./data:/app
